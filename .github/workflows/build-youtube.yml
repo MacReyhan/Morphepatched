@@ -15,9 +15,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Java 17 is required by morphe-cli. Node is only needed for the apkmd
-      # scraper, so we use the LTS (Node 22) — Node 20 is deprecated on
-      # GitHub Actions runners as of 2025-09-19.
       - name: Setup Node.js (LTS)
         uses: actions/setup-node@v4
         with:
@@ -31,7 +28,6 @@ jobs:
 
       - name: Fetch Target, Scrape and Compile YouTube
         env:
-          # Bump the GitHub API rate limit from 60/h to 5000/h.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -43,10 +39,9 @@ jobs:
           # Mirrors Morphe Manager's picker
           # (morphe-manager HomeViewModel.kt `recommendedVersionsFlow`):
           # for the target package, take the highest non-experimental
-          # version. `sort -V` is version-aware (so 20.51.39 > 20.5.36),
-          # unlike plain alphabetical `tail -n 1`. `(.isExperimental // false)
-          # == false` treats missing flags as non-experimental — same as
-          # PatchInfo.kt's `experimentalVersions` set semantics.
+          # version. `sort -V` is version-aware, unlike alphabetical `tail`.
+          # `(.isExperimental // false) == false` treats missing flags as
+          # non-experimental — same as PatchInfo.kt semantics.
           # ----------------------------------------------------------------
           echo "📥 Fetching live patch matrix from official Morphe source..."
           curl -fsSL \
@@ -105,15 +100,28 @@ jobs:
 
           # ----------------------------------------------------------------
           # 4. Scrape the clean YouTube APK from APKMirror.
-          # The npm package is `apkmirror-downloader` (NOT `apkmd` — `apkmd`
-          # is just the bin name it registers). npx falls back to running
-          # the only registered bin when the package name has no matching
-          # bin. The CLI requires the `download` subcommand with positional
-          # `<org> <repo>` args; without it, apkmd looks for ./apps.json
-          # and exits 1.
+          # The npm package `apkmirror-downloader` v2.0.10 ships its bin
+          # (`dist/cli.js`) WITHOUT a shebang and WITHOUT the executable
+          # bit. Invoking `.bin/apkmd` directly via npx fails with
+          # `Syntax error: "(" unexpected` because bash parses the JS
+          # as shell. Workaround: install the package and call `node`
+          # on cli.js directly.
+          #
+          # The CLI itself requires a `download` subcommand with
+          # positional `<org> <repo>`; without it, apkmd looks for
+          # ./apps.json and exits 1.
           # ----------------------------------------------------------------
+          echo "📦 Installing apkmirror-downloader..."
+          npm install --no-save --prefix ./tools apkmirror-downloader
+          APKMD="./tools/node_modules/apkmirror-downloader/dist/cli.js"
+          if [ ! -f "$APKMD" ]; then
+            echo "❌ Fatal: $APKMD not found after install."
+            ls -la ./tools/node_modules/apkmirror-downloader/ 2>/dev/null || true
+            exit 1
+          fi
+
           echo "🚀 Scraping APKMirror for arm64-v8a / nodpi..."
-          npx --yes apkmirror-downloader download google-inc youtube \
+          node "$APKMD" download google-inc youtube \
             --version "$TARGET_VERSION" \
             --arch arm64-v8a \
             --dpi nodpi \
@@ -127,10 +135,10 @@ jobs:
 
           # ----------------------------------------------------------------
           # 5. Patch with morphe-cli.
-          # Per docs/1_usage.md: java -jar morphe-cli.jar patch \
-          #                       --patches patches.mpp input.apk
+          # Per docs/1_usage.md:
+          #   java -jar morphe-cli.jar patch --patches patches.mpp input.apk
           # The CLI writes the patched file next to the input as
-          # `<input>.patched.apk` by default; we move it into output_apk/.
+          # `<input>.patched.apk`; we move it into output_apk/.
           # ----------------------------------------------------------------
           echo "🔨 Patching with morphe-cli $CLI_TAG..."
           java -jar morphe-cli.jar patch \
