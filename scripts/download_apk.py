@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
 Download a clean APK from APKMirror using curl-cffi's TLS impersonation to
-bypass Cloudflare's JS challenge. Adapted from RookieEnough/Morphe-AutoBuilds'
-approach (src/__init__.py uses curl_cffi.requests.Session(impersonate=...)).
+bypass Cloudflare's JS challenge.
+
+Strategy mirrors the one used in RookieEnough/Morphe-AutoBuilds (their
+`src/__init__.py` does `requests.Session(impersonate=DEFAULT_CHROME)`).
+We impersonate firefox133 because in our testing, current Chrome profiles are
+still Cloudflare-challenged on apkmirror.com while firefox133 is not.
+
+Flow (APKMirror 3-step download dance):
+  1. Release page:  /apk/{org}/{repo}/{repo}-{version-dashed}-release/
+       — find a row whose text contains "APK", arch, and dpi strings.
+       — follow the row's `<a class="accent_color">` to get the variant page.
+  2. Variant page:  .../{repo}-{version-dashed}[-{N}]-android-apk-download/
+       — find `<a class="downloadButton">` and follow it.
+  3. Final page:    /wp-content/themes/APKMirror/apk-new.php?id=...
+       — find `<a id="download-link">` whose href is the actual download URL.
+  4. Stream the URL returned by step 3 to a file.
 
 Usage:
     download_apk.py <org> <repo> <version> <arch> <dpi> <outfile>
 
 Example:
     download_apk.py google-inc youtube 20.51.39 arm64-v8a nodpi clean_youtube.apk
-
-How APKMirror URLs work:
-    Main page:    /apk/{org}/{repo}/
-    Release page: /apk/{org}/{repo}/{repo}-{version-dashed}-release/
-    Variants:     /apk/{org}/{repo}/{repo}-{version-dashed}-release/
-                      {repo}-{version-dashed}[-{N}]-android-apk-download/
-    - The first variant has no "-{N}" suffix; later variants have -2, -3, -4...
-    - The single-APK variants end in ".apk" in the page text; bundle variants
-      end in ".apkm" (App Bundle, not directly installable).
-    - We want the standalone .apk variant whose spec matches the requested
-      arch + DPI (e.g., "nodpi" + arm64-v8a present).
 """
 import re
 import sys
@@ -32,12 +35,7 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-
-# Note: as of late 2025/2026, Chrome impersonation in curl-cffi still gets
-# Cloudflare-challenged on apkmirror.com. firefox133 / safari17_0 impersonations
-# are NOT. Reference project uses DEFAULT_CHROME; we override here because of
-# observed failures.
-IMPERSONATE = "firefox133"
+IMPERSONATE = "firefox133"  # see module docstring for why
 
 
 def main() -> int:
@@ -51,168 +49,121 @@ def main() -> int:
     org, repo, version, want_arch, want_dpi, outfile = sys.argv[1:7]
     version_dashed = version.replace(".", "-")
 
+    import time
     session = requests.Session(impersonate=IMPERSONATE)
     session.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
 
+    def get(url):
+        # Small delay between requests — APKMirror rate-limits aggressively
+        # even with curl-cffi impersonation. In CI on fresh IPs this rarely
+        # triggers, but the delays keep us under any per-IP throttling.
+        time.sleep(1.0)
+        return session.get(url, timeout=30)
+
     # ----------------------------------------------------------------------
-    # 1. Resolve the release page for this version.
+    # Step 1: Release page → variant page.
     # ----------------------------------------------------------------------
     release_url = f"{BASE}/apk/{org}/{repo}/{repo}-{version_dashed}-release/"
-    print(f"📄 Release page: {release_url}")
-    r = session.get(release_url, timeout=30)
+    print(f"📄 Release: {release_url}")
+    r = get(release_url)
     if r.status_code != 200:
         print(f"❌ Release page returned {r.status_code}", file=sys.stderr)
-        # Fallback: try to scrape from the main app page (less reliable)
-        main_url = f"{BASE}/apk/{org}/{repo}/"
-        r = session.get(main_url, timeout=30)
-        if r.status_code != 200:
-            print(f"❌ Main page also returned {r.status_code}", file=sys.stderr)
-            return 1
-        soup = BeautifulSoup(r.content, "html.parser")
-        target_pat = re.compile(
-            rf"/apk/{re.escape(org)}/{re.escape(repo)}/"
-            rf"{re.escape(repo)}-{re.escape(version_dashed)}-release/"
-        )
-        hits = [a["href"] for a in soup.find_all("a", href=True) if target_pat.search(a["href"])]
-        if not hits:
-            print(f"❌ No release link found for version {version}", file=sys.stderr)
-            return 1
-        release_url = urljoin(BASE, sorted(set(hits))[0])
-        print(f"📄 Fallback release page: {release_url}")
-        r = session.get(release_url, timeout=30)
-        if r.status_code != 200:
-            print(f"❌ Fallback release page returned {r.status_code}", file=sys.stderr)
-            return 1
-
-    soup = BeautifulSoup(r.content, "html.parser")
-
-    # ----------------------------------------------------------------------
-    # 2. List all variant download pages for this release.
-    # Each variant has its own page; URLs end in -android-apk-download/.
-    # The first variant has no "-{N}" suffix; others have -2, -3, -4, ...
-    # ----------------------------------------------------------------------
-    variant_re = re.compile(
-        rf"/apk/{re.escape(org)}/{re.escape(repo)}/"
-        rf"{re.escape(repo)}-{re.escape(version_dashed)}-release/"
-        rf"{re.escape(repo)}-{re.escape(version_dashed)}(-(?P<n>\d+))?-android-apk-download/"
-        rf"(?:#.*)?$"
-    )
-    seen = set()
-    variants = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        m = variant_re.match(href)
-        if m and href not in seen:
-            seen.add(href)
-            variant_n = int(m.group("n")) if m.group("n") else 1
-            variants.append((variant_n, urljoin(BASE, href)))
-
-    if not variants:
-        print(f"❌ No variant download pages found on release page", file=sys.stderr)
         return 1
-    variants.sort()
-    print(f"🔍 Found {len(variants)} variant page(s): {[n for n, _ in variants]}")
+    release_soup = BeautifulSoup(r.content, "html.parser")
 
-    # ----------------------------------------------------------------------
-    # 3. For each variant, fetch its page and check arch + DPI.
-    # We prefer standalone .apk (singular) over .apkm bundle, since the
-    # morphe-cli patcher expects a single APK.
-    # ----------------------------------------------------------------------
-    arch_aliases = {
-        "arm64-v8a": ["arm64-v8a", "arm64"],
-        "armeabi-v7a": ["armeabi-v7a", "armv7", "armeabi"],
-        "x86": ["x86"],
-        "x86_64": ["x86_64", "x86-64"],
-        "universal": ["universal", "noarch"],
-    }
-    arch_match = arch_aliases.get(want_arch, [want_arch.lower()])
-    dpi_match = want_dpi.lower()  # "nodpi", "240dpi", etc.
-
-    scored = []  # (score, variant_n, variant_url, page)
-    for n, url in variants:
-        rv = session.get(url, timeout=30)
-        if rv.status_code != 200:
-            print(f"  variant {n}: HTTP {rv.status_code}, skipping")
+    # APKMirror lists variants as rows in a table; each row is a
+    # `<div class="table-row headerFont">` and contains text like:
+    # "APK   arm64-v8a + armeabi-v7a   213-640dpi   Android 9.0+"
+    rows = release_soup.find_all("div", class_="table-row headerFont")
+    # The download-button href we want has class "accent_color"
+    variant_page = None
+    matched_row_text = None
+    for row in rows:
+        text = row.get_text(" ", strip=True)
+        if "APK" not in text:
             continue
-        vsoup = BeautifulSoup(rv.content, "html.parser")
-        text_blob = " ".join(vsoup.stripped_strings)
-        # .apk vs .apkm — we want .apk (single APK, installable)
-        is_single_apk = (
-            "apkmirror.com.apk" in text_blob and "apkmirror.com.apkm" not in text_blob
-        ) or (
-            # title typically mentions "APK Download" for single APK and
-            # "APK Bundle Download" for .apkm
-            "apk download" in text_blob.lower()
-            and "apk bundle download" not in text_blob.lower()
-        )
-        # Arch present in spec?
-        arch_ok = any(tok in text_blob.lower() for tok in arch_match)
-        # DPI present in spec?
-        dpi_ok = dpi_match in text_blob.lower() or (
-            dpi_match == "nodpi" and "nodpi" in text_blob.lower()
-        )
-        # Score: prefer single APK, then arch match, then dpi match
-        score = (3 if is_single_apk else 0) + (2 if arch_ok else 0) + (1 if dpi_ok else 0)
-        print(f"  variant {n}: score={score} apk={is_single_apk} arch={arch_ok} dpi={dpi_ok}")
-        scored.append((score, n, url, vsoup))
-
-    if not scored:
-        print(f"❌ Could not load any variant page", file=sys.stderr)
-        return 1
-
-    scored.sort(key=lambda x: (-x[0], x[1]))  # highest score, lowest variant #
-    _, best_n, best_url, best_soup = scored[0]
-    print(f"🎯 Picked variant {best_n}: {best_url}")
-
-    # ----------------------------------------------------------------------
-    # 4. On the variant page, find the actual download link/button.
-    # APKMirror's variant page has either a direct link or a button that
-    # triggers a redirect to the actual download URL.
-    # ----------------------------------------------------------------------
-    download_url = None
-
-    # Look for direct APK/APKM download link
-    for a in best_soup.find_all("a", href=True):
-        href = a["href"]
-        if href.startswith("/wp-content/") or "download.php" in href or href.endswith((".apk", ".apkm")):
-            download_url = urljoin(BASE, href)
+        if want_arch not in text:
+            continue
+        if want_dpi not in text:
+            continue
+        link = row.find("a", class_="accent_color")
+        if link and link.get("href"):
+            variant_page = urljoin(BASE, link["href"])
+            matched_row_text = text
             break
 
-    # Look for a download button (data-url, data-href, onclick with location)
-    if not download_url:
-        btn = best_soup.find(["a", "button"], attrs={"data-url": True})
-        if btn:
-            download_url = urljoin(BASE, btn["data-url"])
+    # If no row matched exactly (some YouTube variants list "universal" + nodpi
+    # rather than "arm64-v8a + nodpi"), relax the arch check to allow any row
+    # whose arch text overlaps with ours. Fallback: first row matching type+dpi.
+    if not variant_page:
+        for row in rows:
+            text = row.get_text(" ", strip=True)
+            if "APK" not in text:
+                continue
+            if want_dpi not in text:
+                continue
+            link = row.find("a", class_="accent_color")
+            if link and link.get("href"):
+                variant_page = urljoin(BASE, link["href"])
+                matched_row_text = text
+                break
 
-    if not download_url:
-        btn = best_soup.find("a", id="download") or best_soup.find(
-            "a", class_=re.compile(r"download", re.I)
-        )
-        if btn and btn.get("href"):
-            download_url = urljoin(BASE, btn["href"])
-
-    if not download_url:
-        print(f"❌ No download link/button found on variant page", file=sys.stderr)
-        # Print some diagnostics
-        print("--- relevant anchors (first 10) ---")
-        for a in best_soup.find_all("a", href=True)[:10]:
-            print(f"  {a.get('href')[:120]!r} text={a.get_text(strip=True)[:60]!r}")
+    if not variant_page:
+        print(f"❌ No variant row matches arch={want_arch!r} dpi={want_dpi!r}", file=sys.stderr)
+        print("    Available rows:")
+        for row in rows:
+            print(f"      {row.get_text(' ', strip=True)[:120]}")
         return 1
-
-    print(f"⬇️  Downloading from: {download_url}")
+    print(f"🎯 Variant row: {matched_row_text!r}")
+    print(f"📄 Variant page: {variant_page}")
 
     # ----------------------------------------------------------------------
-    # 5. Stream the file. APKMirror's final URL often issues a 302 to a
-    # CDN; the curl_cffi session follows redirects automatically.
+    # Step 2: Variant page → final download page.
     # ----------------------------------------------------------------------
-    with session.get(download_url, stream=True, timeout=120, allow_redirects=True) as resp:
+    rv = get(variant_page)
+    if rv.status_code != 200:
+        print(f"❌ Variant page returned {rv.status_code}", file=sys.stderr)
+        return 1
+    variant_soup = BeautifulSoup(rv.content, "html.parser")
+
+    download_button = variant_soup.find("a", class_="downloadButton")
+    if not download_button or not download_button.get("href"):
+        print(f"❌ No downloadButton on variant page", file=sys.stderr)
+        return 1
+    download_page = urljoin(BASE, download_button["href"])
+    print(f"📄 Download page: {download_page}")
+
+    rd = get(download_page)
+    if rd.status_code != 200:
+        print(f"❌ Download page returned {rd.status_code}", file=sys.stderr)
+        return 1
+    download_soup = BeautifulSoup(rd.content, "html.parser")
+
+    # ----------------------------------------------------------------------
+    # Step 3: Final page → the actual APK URL (typically a CDN link).
+    # ----------------------------------------------------------------------
+    link = download_soup.find("a", id="download-link")
+    if not link or not link.get("href"):
+        print(f"❌ No download-link anchor on final page", file=sys.stderr)
+        return 1
+    final_url = urljoin(BASE, link["href"])
+    print(f"⬇️  Final URL: {final_url}")
+
+    # ----------------------------------------------------------------------
+    # Step 4: Stream the file.
+    # NOTE: curl_cffi.requests.Response does NOT support `with` as a
+    # context manager, so we use try/finally for explicit cleanup.
+    # ----------------------------------------------------------------------
+    time.sleep(1.0)
+    resp = session.get(final_url, stream=True, timeout=180, allow_redirects=True)
+    try:
         if resp.status_code != 200:
             print(f"❌ Final download returned {resp.status_code}", file=sys.stderr)
             return 1
         ct = resp.headers.get("content-type", "")
         if "html" in ct.lower():
-            print(f"❌ Final URL returned HTML instead of APK (content-type={ct})", file=sys.stderr)
-            print("    Possibly Cloudflare-challenged. Last URL:", resp.url)
+            print(f"❌ Final URL returned HTML instead of binary (content-type={ct})", file=sys.stderr)
+            print(f"    Last URL: {resp.url}")
             return 1
         total = int(resp.headers.get("content-length", 0))
         written = 0
@@ -221,7 +172,9 @@ def main() -> int:
                 if chunk:
                     f.write(chunk)
                     written += len(chunk)
-        print(f"✅ Downloaded {written:,} bytes ({written:,}/{total:, if total else '?'}) to {outfile}")
+        print(f"✅ Downloaded {written:,} bytes to {outfile}")
+    finally:
+        resp.close()
 
     return 0
 
