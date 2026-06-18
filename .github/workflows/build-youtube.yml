@@ -3,9 +3,13 @@ name: Compile My Custom Morphe YouTube
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-youtube:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
@@ -24,14 +28,29 @@ jobs:
 
       - name: Fetch Target, Scrape and Compile YouTube
         run: |
+          set -euo pipefail
           mkdir -p output_apk
 
           echo "📥 Fetching live patch matrix from official Morphe source..."
-          curl -s "https://raw.githubusercontent.com/MorpheApp/morphe-patches/main/patches-list.json" > patches.json
+          curl -fsSL "https://raw.githubusercontent.com/MorpheApp/morphe-patches/main/patches-list.json" -o patches.json
 
           echo "🔍 Parsing exact recommended stable version for YouTube..."
-          # Secure extraction targeting the nested compatiblePackages blocks, safely ignoring null/empty entries
-          TARGET_VERSION=$(jq -r '.patches[]? | select(.compatiblePackages != null) | .compatiblePackages[]? | select(.packageName == "com.google.android.youtube") | .targets[]? | select(.isExperimental == false) | .version' patches.json | tail -n 1)
+          # Pick the highest non-experimental version, mirroring Morphe Manager's
+          # algorithm (HomeViewModel.kt `recommendedVersionsFlow`). Order doesn't
+          # matter for YouTube since all default patches share the same stable set,
+          # but version-aware sort (sort -V) is required to avoid picking
+          # 4.5.36 over 4.28.55 — plain `tail` is alphabetical.
+          # `(.isExperimental // false) == false` defaults missing fields to false
+          # and matches how PatchInfo.kt constructs `experimentalVersions`.
+          TARGET_VERSION=$(jq -r '
+            .patches[]?
+            | select(.compatiblePackages != null)
+            | .compatiblePackages[]?
+            | select(.packageName == "com.google.android.youtube")
+            | .targets[]?
+            | select((.isExperimental // false) == false)
+            | .version
+          ' patches.json | sort -V | tail -n 1)
 
           if [ -z "$TARGET_VERSION" ] || [ "$TARGET_VERSION" == "null" ]; then
             echo "❌ Error: Could not parse stable YouTube version. Aborting."
@@ -41,21 +60,31 @@ jobs:
           echo "🎯 Recommended YouTube Target Version found: $TARGET_VERSION"
 
           echo "🚀 Scraping APKMirror for clean arm64-v8a layout using Node execution..."
-          # Swapped 'apkmd' out for 'npx apkmirror-downloader' to completely bypass the bash syntax error bug
-          npx apkmirror-downloader --org google-inc --repo youtube --version "$TARGET_VERSION" --arch arm64-v8a --dpi nodpi --outDir . --outFile clean_youtube.apk
+          # `--yes` lets npx auto-install without prompting in non-interactive CI.
+          npx --yes apkmirror-downloader \
+            --org google-inc \
+            --repo youtube \
+            --version "$TARGET_VERSION" \
+            --arch arm64-v8a \
+            --dpi nodpi \
+            --outDir . \
+            --outFile clean_youtube.apk
 
           if [ -f "clean_youtube.apk" ]; then
             echo "🔨 Compiling with official local Morphe CLI framework..."
-            npx @morpheapp/cli patch --apk clean_youtube.apk --output output_apk/Morphe-YouTube-Targeted.apk
+            npx --yes @morpheapp/cli patch \
+              --apk clean_youtube.apk \
+              --output output_apk/Morphe-YouTube-Targeted.apk
             echo "✅ Morphe patch successfully injected!"
           else
             echo "❌ Fatal Error: Base YouTube binary download failed."
             exit 1
           fi
 
-      - name: Upload Audited Pristine APK
+      - name: Upload Patched APK
         uses: actions/upload-artifact@v4
         with:
-          name: Clean-Morphe-YouTube
+          name: Morphe-YouTube-Patched
           path: output_apk/Morphe-YouTube-Targeted.apk
+          if-no-files-found: error
           retention-days: 3
