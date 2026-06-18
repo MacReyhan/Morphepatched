@@ -15,10 +15,13 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Environment
+      # Java 17 is required by morphe-cli. Node is only needed for the apkmd
+      # scraper, so we use the LTS (Node 22) — Node 20 is deprecated on
+      # GitHub Actions runners as of 2025-09-19.
+      - name: Setup Node.js (LTS)
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup Java (OpenJDK 17)
         uses: actions/setup-java@v4
@@ -27,21 +30,32 @@ jobs:
           java-version: '17'
 
       - name: Fetch Target, Scrape and Compile YouTube
+        env:
+          # Bump the GitHub API rate limit from 60/h to 5000/h.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          mkdir -p output_apk
+          mkdir -p output_apk workdir
+          cd workdir
 
+          # ----------------------------------------------------------------
+          # 1. Determine the recommended stable YouTube version.
+          # Mirrors Morphe Manager's picker
+          # (morphe-manager HomeViewModel.kt `recommendedVersionsFlow`):
+          # for the target package, take the highest non-experimental
+          # version. `sort -V` is version-aware (so 20.51.39 > 20.5.36),
+          # unlike plain alphabetical `tail -n 1`. `(.isExperimental // false)
+          # == false` treats missing flags as non-experimental — same as
+          # PatchInfo.kt's `experimentalVersions` set semantics.
+          # ----------------------------------------------------------------
           echo "📥 Fetching live patch matrix from official Morphe source..."
-          curl -fsSL "https://raw.githubusercontent.com/MorpheApp/morphe-patches/main/patches-list.json" -o patches.json
+          curl -fsSL \
+            "https://raw.githubusercontent.com/MorpheApp/morphe-patches/main/patches-list.json" \
+            -o patches.json
 
-          echo "🔍 Parsing exact recommended stable version for YouTube..."
-          # Pick the highest non-experimental version, mirroring Morphe Manager's
-          # algorithm (HomeViewModel.kt `recommendedVersionsFlow`). Order doesn't
-          # matter for YouTube since all default patches share the same stable set,
-          # but version-aware sort (sort -V) is required to avoid picking
-          # 4.5.36 over 4.28.55 — plain `tail` is alphabetical.
-          # `(.isExperimental // false) == false` defaults missing fields to false
-          # and matches how PatchInfo.kt constructs `experimentalVersions`.
+          PATCHES_VERSION=$(jq -r '.version' patches.json)
+          echo "📦 patches-list.json reports patch bundle version: $PATCHES_VERSION"
+
           TARGET_VERSION=$(jq -r '
             .patches[]?
             | select(.compatiblePackages != null)
@@ -52,16 +66,51 @@ jobs:
             | .version
           ' patches.json | sort -V | tail -n 1)
 
-          if [ -z "$TARGET_VERSION" ] || [ "$TARGET_VERSION" == "null" ]; then
-            echo "❌ Error: Could not parse stable YouTube version. Aborting."
+          if [ -z "$TARGET_VERSION" ] || [ "$TARGET_VERSION" = "null" ]; then
+            echo "❌ Error: could not parse stable YouTube version. Aborting."
             exit 1
           fi
+          echo "🎯 Recommended YouTube target: $TARGET_VERSION"
 
-          echo "🎯 Recommended YouTube Target Version found: $TARGET_VERSION"
+          # ----------------------------------------------------------------
+          # 2. Download the matching patches .mpp from morphe-patches release.
+          # The patches-list.json "version" field matches the release tag
+          # and the bundled .mpp asset name.
+          # ----------------------------------------------------------------
+          echo "📦 Downloading patches-${PATCHES_VERSION}.mpp..."
+          curl -fsSL -o patches.mpp \
+            "https://github.com/MorpheApp/morphe-patches/releases/download/v${PATCHES_VERSION}/patches-${PATCHES_VERSION}.mpp"
 
-          echo "🚀 Scraping APKMirror for clean arm64-v8a layout using Node execution..."
-          # `--yes` lets npx auto-install without prompting in non-interactive CI.
-          npx --yes apkmirror-downloader \
+          # ----------------------------------------------------------------
+          # 3. Download the latest morphe-cli jar from its GitHub release.
+          # The cli is NOT on npm — `@morpheapp/cli` 404s. The jar is the
+          # only supported way to invoke it headlessly.
+          # ----------------------------------------------------------------
+          echo "📦 Resolving latest morphe-cli release..."
+          CLI_JSON=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/MorpheApp/morphe-cli/releases/latest")
+          CLI_TAG=$(echo "$CLI_JSON" | jq -r '.tag_name')
+          CLI_ASSET_URL=$(echo "$CLI_JSON" \
+            | jq -r '.assets[] | select(.name | endswith("-all.jar")) | .browser_download_url')
+
+          if [ -z "$CLI_ASSET_URL" ] || [ "$CLI_ASSET_URL" = "null" ]; then
+            echo "❌ Error: could not locate morphe-cli *-all.jar in release $CLI_TAG."
+            exit 1
+          fi
+          echo "📦 Downloading $CLI_TAG jar..."
+          curl -fsSL -o morphe-cli.jar "$CLI_ASSET_URL"
+          ls -lh morphe-cli.jar patches.mpp
+
+          # ----------------------------------------------------------------
+          # 4. Scrape the clean YouTube APK from APKMirror.
+          # The npm package `apkmirror-downloader` registers its bin as
+          # `apkmd`, NOT as the package name — so `npx apkmd`, not
+          # `npx apkmirror-downloader`.
+          # ----------------------------------------------------------------
+          echo "🚀 Scraping APKMirror for arm64-v8a / nodpi..."
+          npx --yes apkmd \
             --org google-inc \
             --repo youtube \
             --version "$TARGET_VERSION" \
@@ -70,16 +119,31 @@ jobs:
             --outDir . \
             --outFile clean_youtube.apk
 
-          if [ -f "clean_youtube.apk" ]; then
-            echo "🔨 Compiling with official local Morphe CLI framework..."
-            npx --yes @morpheapp/cli patch \
-              --apk clean_youtube.apk \
-              --output output_apk/Morphe-YouTube-Targeted.apk
-            echo "✅ Morphe patch successfully injected!"
-          else
-            echo "❌ Fatal Error: Base YouTube binary download failed."
+          if [ ! -f "clean_youtube.apk" ]; then
+            echo "❌ Fatal: APK download failed."
             exit 1
           fi
+
+          # ----------------------------------------------------------------
+          # 5. Patch with morphe-cli.
+          # Per docs/1_usage.md: java -jar morphe-cli.jar patch \
+          #                       --patches patches.mpp input.apk
+          # The CLI writes the patched file next to the input as
+          # `<input>.patched.apk` by default; we move it into output_apk/.
+          # ----------------------------------------------------------------
+          echo "🔨 Patching with morphe-cli $CLI_TAG..."
+          java -jar morphe-cli.jar patch \
+            --patches patches.mpp \
+            clean_youtube.apk
+
+          if [ ! -f "clean_youtube.apk.patched.apk" ]; then
+            echo "❌ Fatal: morphe-cli did not produce a patched APK."
+            echo "   Listing workdir:"
+            ls -la
+            exit 1
+          fi
+          mv clean_youtube.apk.patched.apk ../output_apk/Morphe-YouTube-Targeted.apk
+          echo "✅ Patch succeeded."
 
       - name: Upload Patched APK
         uses: actions/upload-artifact@v4
