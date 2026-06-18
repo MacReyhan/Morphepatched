@@ -26,6 +26,11 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
+      - name: Setup Python (for APKMirror scraper)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Fetch Target, Scrape and Compile YouTube
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -69,8 +74,6 @@ jobs:
 
           # ----------------------------------------------------------------
           # 2. Download the matching patches .mpp from morphe-patches release.
-          # The patches-list.json "version" field matches the release tag
-          # and the bundled .mpp asset name.
           # ----------------------------------------------------------------
           echo "📦 Downloading patches-${PATCHES_VERSION}.mpp..."
           curl -fsSL -o patches.mpp \
@@ -78,8 +81,6 @@ jobs:
 
           # ----------------------------------------------------------------
           # 3. Download the latest morphe-cli jar from its GitHub release.
-          # The cli is NOT on npm — `@morpheapp/cli` 404s. The jar is the
-          # only supported way to invoke it headlessly.
           # ----------------------------------------------------------------
           echo "📦 Resolving latest morphe-cli release..."
           CLI_JSON=$(curl -fsSL \
@@ -100,45 +101,26 @@ jobs:
 
           # ----------------------------------------------------------------
           # 4. Scrape the clean YouTube APK from APKMirror.
-          # The npm package `apkmirror-downloader` v2.0.10 ships its bin
-          # (`dist/cli.js`) WITHOUT a shebang and WITHOUT the executable
-          # bit. Invoking `.bin/apkmd` directly via npx fails with
-          # `Syntax error: "(" unexpected` because bash parses the JS
-          # as shell. Workaround: install the package and call `node`
-          # on cli.js directly.
-          #
-          # The CLI itself requires a `download` subcommand with
-          # positional `<org> <repo>`; without it, apkmd looks for
-          # ./apps.json and exits 1.
+          # APKMirror is gated by Cloudflare's JS challenge, which a plain
+          # HTTP client (cheerio/requests) cannot pass. We use curl_cffi with
+          # firefox133 TLS impersonation, which bypasses the challenge.
+          # Strategy adapted from RookieEnough/Morphe-AutoBuilds.
           # ----------------------------------------------------------------
-          echo "📦 Installing apkmirror-downloader..."
-          npm install --no-save --prefix ./tools apkmirror-downloader
-          APKMD="./tools/node_modules/apkmirror-downloader/dist/cli.js"
-          if [ ! -f "$APKMD" ]; then
-            echo "❌ Fatal: $APKMD not found after install."
-            ls -la ./tools/node_modules/apkmirror-downloader/ 2>/dev/null || true
-            exit 1
-          fi
+          echo "📦 Installing python deps (curl-cffi, beautifulsoup4)..."
+          pip install --quiet curl-cffi beautifulsoup4
 
-          echo "🚀 Scraping APKMirror for arm64-v8a / nodpi..."
-          node "$APKMD" download google-inc youtube \
-            --version "$TARGET_VERSION" \
-            --arch arm64-v8a \
-            --dpi nodpi \
-            --outdir . \
-            --outfile clean_youtube.apk
+          echo "🚀 Scraping APKMirror..."
+          python3 ../scripts/download_apk.py \
+            google-inc youtube "$TARGET_VERSION" arm64-v8a nodpi \
+            clean_youtube.apk
 
           if [ ! -f "clean_youtube.apk" ]; then
-            echo "❌ Fatal: APK download failed."
+            echo "❌ Fatal: clean_youtube.apk not produced."
             exit 1
           fi
 
           # ----------------------------------------------------------------
           # 5. Patch with morphe-cli.
-          # Per docs/1_usage.md:
-          #   java -jar morphe-cli.jar patch --patches patches.mpp input.apk
-          # The CLI writes the patched file next to the input as
-          # `<input>.patched.apk`; we move it into output_apk/.
           # ----------------------------------------------------------------
           echo "🔨 Patching with morphe-cli $CLI_TAG..."
           java -jar morphe-cli.jar patch \
