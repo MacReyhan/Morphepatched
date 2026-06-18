@@ -105,14 +105,15 @@ jobs:
 
           # ----------------------------------------------------------------
           # 4. Scrape the clean YouTube APK from APKMirror.
-          # The npm package `apkmirror-downloader` registers its bin as
-          # `apkmd`, NOT as the package name. The CLI also requires the
-          # `download` subcommand — without it, apkmd falls back to its
-          # JSON-config-file mode (looks for ./apps.json) and exits 1.
-          # Positional args: <org> <repo>. Option names are lowercase.
+          # The npm package is `apkmirror-downloader` (NOT `apkmd` — `apkmd`
+          # is just the bin name it registers). npx falls back to running
+          # the only registered bin when the package name has no matching
+          # bin. The CLI requires the `download` subcommand with positional
+          # `<org> <repo>` args; without it, apkmd looks for ./apps.json
+          # and exits 1.
           # ----------------------------------------------------------------
           echo "🚀 Scraping APKMirror for arm64-v8a / nodpi..."
-          npx --yes apkmd download google-inc youtube \
+          npx --yes apkmirror-downloader download google-inc youtube \
             --version "$TARGET_VERSION" \
             --arch arm64-v8a \
             --dpi nodpi \
