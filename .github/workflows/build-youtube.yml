@@ -123,9 +123,27 @@ jobs:
           # 5. Patch with morphe-cli.
           # ----------------------------------------------------------------
           echo "🔨 Patching with morphe-cli $CLI_TAG..."
-          java -jar morphe-cli.jar patch \
+          # Try using --out to direct the output.
+          # If it fails, fallback to running without --out.
+          if ! java -jar morphe-cli.jar patch \
             --patches patches.mpp \
-            clean_youtube.apk
+            --out clean_youtube.apk.patched.apk \
+            clean_youtube.apk; then
+              echo "⚠️  Patching command with --out failed. Retrying without it..."
+              java -jar morphe-cli.jar patch \
+                --patches patches.mpp \
+                clean_youtube.apk
+          fi
+
+          if [ ! -f "clean_youtube.apk.patched.apk" ]; then
+            echo "🔍 clean_youtube.apk.patched.apk not found in root. Searching in subdirectories..."
+            # Find any APK in subdirectories (excluding the original clean_youtube.apk at the root level)
+            FOUND_APK=$(find . -mindepth 2 -name "*.apk" 2>/dev/null | head -n 1)
+            if [ -n "$FOUND_APK" ] && [ -f "$FOUND_APK" ]; then
+              echo "📦 Found patched APK at fallback path: $FOUND_APK"
+              cp "$FOUND_APK" clean_youtube.apk.patched.apk
+            fi
+          fi
 
           if [ ! -f "clean_youtube.apk.patched.apk" ]; then
             echo "❌ Fatal: morphe-cli did not produce a patched APK."
