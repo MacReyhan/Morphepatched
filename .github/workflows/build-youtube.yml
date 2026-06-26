@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+  actions: write
 
 jobs:
   build-youtube:
@@ -161,3 +162,48 @@ jobs:
           path: output_apk/Morphe-YouTube-Targeted.apk
           if-no-files-found: error
           retention-days: 3
+
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd workdir
+
+          # Extract target version parsed in previous step
+          TARGET_VERSION=$(jq -r '
+            .patches[]?
+            | select(.compatiblePackages != null)
+            | .compatiblePackages[]?
+            | select(.packageName == "com.google.android.youtube")
+            | .targets[]?
+            | select((.isExperimental // false) == false)
+            | .version
+          ' patches.json | sort -V | tail -n 1)
+
+          PATCHES_VERSION=$(jq -r '.version' patches.json)
+          TAG_NAME="v${TARGET_VERSION}"
+          RELEASE_TITLE="YouTube Morphe v${TARGET_VERSION}"
+
+          echo "🚀 Creating or updating GitHub Release for tag: ${TAG_NAME}"
+
+          # Delete existing release and tag if they exist
+          gh release delete "${TAG_NAME}" --cleanup-tag --yes || true
+
+          # Create new release with the APK asset
+          gh release create "${TAG_NAME}" \
+            ../output_apk/Morphe-YouTube-Targeted.apk \
+            --title "${RELEASE_TITLE}" \
+            --notes "Automatically compiled on $(date +'%Y-%m-%d %H:%M:%S UTC') using patches version ${PATCHES_VERSION}"
+
+      - name: Delete Old Workflow Runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🧹 Cleaning up old workflow runs (keeping latest 3)..."
+          gh run list --limit 100 --json databaseId -q '.[3:] | .[].databaseId' | while read -r run_id; do
+            if [ -n "$run_id" ]; then
+              echo "🗑️ Deleting old run: $run_id"
+              gh run delete "$run_id" || true
+            fi
+          done
